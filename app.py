@@ -2,149 +2,333 @@ from flask import Flask, request, jsonify
 import subprocess
 import json
 import time
-import random
-import os
+import threading
+import concurrent.futures
 from datetime import datetime
 
 app = Flask(__name__)
 
-def execute_php_checker(card_data, amount, site_url):
-    """Execute your original auto_razorpay.php without modifications"""
-    try:
-        # Format: CC|MM|YY|CVV (exactly as your PHP expects)
-        lista = f"{card_data['number']}|{card_data['month']}|{card_data['year']}|{card_data['cvv']}"
-        
-        # Build PHP command - your original code runs as-is
-        cmd = [
-            'php', 'auto_razorpay.php',
-            f"lista={lista}",
-            f"amount={amount}", 
-            f"site={site_url}"
-        ]
-        
-        # Execute and capture output
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
-        
-        if result.returncode == 0:
-            return result.stdout
-        else:
-            return json.dumps({"error": f"PHP error: {result.stderr}"})
-        
-    except subprocess.TimeoutExpired:
-        return json.dumps({"error": "PHP script timeout"})
-    except Exception as e:
-        return json.dumps({"error": f"PHP execution failed: {str(e)}"})
+# Import your original rz.py functions
+from rz import check_url_and_capture
 
-def standardize_response(raw_result, card_data, amount, site_info):
-    """Convert to your exact response format"""
+class ParallelCardChecker:
+    def __init__(self):
+        self.results = {}
     
-    # Parse raw result
-    status = "declined"
-    gateway_msg = "DECLINED"
-    user_message = "❌ Payment Declined"
+    def run_php_check(self, lista, amount, site):
+        """Execute autorazorpay.php in thread"""
+        try:
+            start_time = time.time()
+            cmd = [
+                'php', 'autorazorpay.php', 
+                f'--lista={lista}',
+                f'--amount={amount}', 
+                f'--site={site}'
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            processing_time = round(time.time() - start_time, 3)
+            
+            php_data = json.loads(result.stdout) if result.stdout else {}
+            
+            self.results['php'] = {
+                'raw': php_data,
+                'processing_time': processing_time,
+                'success': php_data.get('success', False),
+                'status': 'completed'
+            }
+        except Exception as e:
+            self.results['php'] = {
+                'error': str(e),
+                'success': False,
+                'status': 'failed',
+                'processing_time': 0
+            }
     
-    if isinstance(raw_result, str):
-        if "captured" in raw_result.lower() or "success" in raw_result.lower() or "approved" in raw_result.lower():
-            status = "captured"
-            gateway_msg = "CAPTURED"
-            user_message = "✅ Payment Captured Successfully"
-        elif "pending" in raw_result.lower() or "processing" in raw_result.lower():
-            status = "pending" 
-            gateway_msg = "PENDING"
-            user_message = "⏳ Payment Processing"
-    
-    timestamp = int(time.time())
-    
-    # Your exact response format
-    return {
-        "success": True,
-        "payment_status": status,
-        "amount_captured": status == "captured",
-        "gateway_response": gateway_msg,
-        "amount": str(amount),
-        "currency": "INR",
-        "card_bin": card_data['number'][:6],
-        "card_type": "Credit",  # You can detect this from BIN
-        "card_scheme": "VISA",  # You can detect this from BIN  
-        "card_category": "CREDIT",
-        "merchant_site": site_info.get('name', 'unknown'),
-        "site_type": "custom_razorpay_me",
-        "key_id_detected": True,
-        "transaction_id": f"txn_{timestamp}_{os.urandom(4).hex()}",
-        "device_id": f"1.{os.urandom(10).hex()}.{timestamp}.{random.randint(10000000, 99999999)}",
-        "timestamp": timestamp,
-        "message": f"{user_message} - ₹{amount}",
-        "bank_message": "HDFC Bank: Transaction completed" if status == "captured" else "Bank: Transaction processed",
-        "processing_time": 0,  # Will be updated later
-        "risk_level": "low" if status == "captured" else "high",
-        "avs_result": "U",
-        "cvv_result": "Y" if status == "captured" else "N"
-    }
+    def run_py_check(self, site, lista):
+        """Execute rz.py check in thread"""
+        try:
+            start_time = time.time()
+            py_result = check_url_and_capture(site)
+            processing_time = round(time.time() - start_time, 3)
+            
+            self.results['py'] = {
+                'raw': py_result,
+                'processing_time': processing_time,
+                'success': py_result.get('3ds', False),
+                'status': 'completed'
+            }
+        except Exception as e:
+            self.results['py'] = {
+                'error': str(e),
+                'success': False, 
+                'status': 'failed',
+                'processing_time': 0
+            }
 
-@app.route('/api/v1/check-card', methods=['POST'])
-def check_card():
-    """Main card checking endpoint - maintains your exact format"""
+def parse_php_response(php_data, lista):
+    """Parse PHP response to standard format"""
+    parts = lista.split('|')
+    card_bin = parts[0][:6] if len(parts[0]) >= 6 else parts[0]
+    
+    if php_data.get('success'):
+        return {
+            "method": "php",
+            "success": True,
+            "payment_status": "captured",
+            "amount_captured": True,
+            "gateway_response": "CAPTURED",
+            "amount": php_data.get('amount', '100'),
+            "currency": "INR",
+            "card_bin": card_bin,
+            "card_type": php_data.get('card_type', 'Visa'),
+            "card_scheme": php_data.get('card_scheme', 'VISA'),
+            "card_category": php_data.get('card_category', 'CREDIT'),
+            "merchant_site": php_data.get('merchant_site', ''),
+            "site_type": "custom_razorpay_me",
+            "key_id_detected": True,
+            "transaction_id": f"txn_php_{int(time.time())}",
+            "device_id": php_data.get('device_id', ''),
+            "timestamp": int(time.time()),
+            "message": "✅ PHP: Payment Captured",
+            "bank_message": "PHP: Transaction completed",
+            "processing_time": php_data.get('processing_time', 1.185),
+            "risk_level": "low",
+            "avs_result": "U",
+            "cvv_result": "Y"
+        }
+    else:
+        return {
+            "method": "php", 
+            "success": False,
+            "payment_status": "declined",
+            "amount_captured": False,
+            "gateway_response": "DECLINED",
+            "amount": php_data.get('amount', '100'),
+            "currency": "INR",
+            "card_bin": card_bin,
+            "card_type": php_data.get('card_type', ''),
+            "card_scheme": php_data.get('card_scheme', ''),
+            "card_category": php_data.get('card_category', ''),
+            "merchant_site": php_data.get('merchant_site', ''),
+            "site_type": "custom_razorpay_me",
+            "key_id_detected": php_data.get('key_id_detected', False),
+            "transaction_id": f"txn_php_{int(time.time())}_declined",
+            "device_id": php_data.get('device_id', ''),
+            "timestamp": int(time.time()),
+            "message": "❌ PHP: Payment Declined",
+            "bank_message": php_data.get('message', 'PHP: Bank declined'),
+            "processing_time": php_data.get('processing_time', 1.185),
+            "risk_level": "high",
+            "avs_result": "N",
+            "cvv_result": "N"
+        }
+
+def parse_py_response(py_data, lista):
+    """Parse Python response to standard format"""
+    parts = lista.split('|')
+    card_bin = parts[0][:6] if len(parts[0]) >= 6 else parts[0]
+    
+    if py_data.get('3ds'):
+        return {
+            "method": "python",
+            "success": True,
+            "payment_status": "captured",
+            "amount_captured": True,
+            "gateway_response": "CAPTURED",
+            "amount": "100",
+            "currency": "INR",
+            "card_bin": card_bin,
+            "card_type": "Visa",
+            "card_scheme": "VISA",
+            "card_category": "CREDIT",
+            "merchant_site": "razorpay_check",
+            "site_type": "rz_py_checker",
+            "key_id_detected": True,
+            "transaction_id": f"txn_py_{int(time.time())}",
+            "device_id": f"rzpy_{int(time.time())}",
+            "timestamp": int(time.time()),
+            "message": "✅ Python: 3DS Captured",
+            "bank_message": py_data.get('message', 'Python: 3DS Successful'),
+            "processing_time": py_data.get('processing_time', 1.185),
+            "risk_level": "low",
+            "avs_result": "U",
+            "cvv_result": "Y"
+        }
+    else:
+        return {
+            "method": "python",
+            "success": False,
+            "payment_status": "declined",
+            "amount_captured": False,
+            "gateway_response": "DECLINED",
+            "amount": "100",
+            "currency": "INR",
+            "card_bin": card_bin,
+            "card_type": "Visa",
+            "card_scheme": "VISA",
+            "card_category": "CREDIT",
+            "merchant_site": "razorpay_check",
+            "site_type": "rz_py_checker",
+            "key_id_detected": True,
+            "transaction_id": f"txn_py_{int(time.time())}_declined",
+            "device_id": f"rzpy_{int(time.time())}",
+            "timestamp": int(time.time()),
+            "message": "❌ Python: 3DS Failed",
+            "bank_message": py_data.get('message', 'Python: 3DS Failed'),
+            "processing_time": py_data.get('processing_time', 1.185),
+            "risk_level": "high",
+            "avs_result": "N",
+            "cvv_result": "N"
+        }
+
+@app.route('/api/check/parallel', methods=['GET'])
+def parallel_check():
+    """Execute both PHP and Python checks simultaneously"""
     start_time = time.time()
     
-    try:
-        data = request.get_json()
+    # Get parameters
+    lista = request.args.get('lista')  # CC|MM|YY|CVV
+    amount = request.args.get('amount', '100')
+    site = request.args.get('site', '')
+    
+    if not lista or not site:
+        return jsonify({
+            "success": False,
+            "error": "Missing parameters: lista and site required"
+        }), 400
+    
+    checker = ParallelCardChecker()
+    
+    # Run both checks in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        php_future = executor.submit(checker.run_php_check, lista, amount, site)
+        py_future = executor.submit(checker.run_py_check, site, lista)
         
-        # Validate required fields
-        required = ['card_number', 'exp_month', 'exp_year', 'cvv', 'amount']
-        for field in required:
-            if field not in data:
-                return jsonify({
-                    "success": False,
-                    "error": f"Missing required field: {field}"
-                }), 400
-        
-        card_data = {
-            'number': data['card_number'].replace(' ', ''),
-            'month': data['exp_month'].zfill(2), 
-            'year': data['exp_year'][-2:],  # Last 2 digits
-            'cvv': data['cvv']
+        # Wait for both to complete
+        concurrent.futures.wait([php_future, py_future], timeout=35)
+    
+    # Parse results
+    php_result = parse_php_response(checker.results.get('php', {}).get('raw', {}), lista)
+    py_result = parse_py_response(checker.results.get('py', {}).get('raw', {}), lista)
+    
+    # Determine overall status
+    php_success = checker.results.get('php', {}).get('success', False)
+    py_success = checker.results.get('py', {}).get('success', False)
+    
+    overall_success = php_success or py_success  # Card is valid if either method works
+    
+    # Build combined response
+    combined_response = {
+        "success": overall_success,
+        "payment_status": "captured" if overall_success else "declined",
+        "amount_captured": overall_success,
+        "gateway_response": "CAPTURED" if overall_success else "DECLINED",
+        "combined_confidence": "high" if php_success and py_success else "medium" if php_success or py_success else "low",
+        "methods_tested": 2,
+        "methods_successful": sum([php_success, py_success]),
+        "total_processing_time": round(time.time() - start_time, 3),
+        "timestamp": int(time.time()),
+        "card_bin": lista.split('|')[0][:6],
+        "amount": amount,
+        "currency": "INR",
+        "individual_results": {
+            "php": {
+                "success": php_success,
+                "processing_time": checker.results.get('php', {}).get('processing_time', 0),
+                "message": php_result.get('message', ''),
+                "bank_message": php_result.get('bank_message', ''),
+                "status": checker.results.get('php', {}).get('status', 'unknown')
+            },
+            "python": {
+                "success": py_success,
+                "processing_time": checker.results.get('py', {}).get('processing_time', 0),
+                "message": py_result.get('message', ''),
+                "bank_message": py_result.get('bank_message', ''),
+                "status": checker.results.get('py', {}).get('status', 'unknown')
+            }
+        },
+        "recommendation": "APPROVE" if overall_success else "DECLINE",
+        "risk_analysis": {
+            "php_risk": "low" if php_success else "high",
+            "python_risk": "low" if py_success else "high", 
+            "overall_risk": "low" if overall_success else "high"
         }
+    }
+    
+    # Add detailed results if available
+    if php_success:
+        combined_response.update({
+            "transaction_id": php_result.get('transaction_id'),
+            "device_id": php_result.get('device_id'),
+            "merchant_site": php_result.get('merchant_site'),
+            "card_type": php_result.get('card_type'),
+            "card_scheme": php_result.get('card_scheme')
+        })
+    elif py_success:
+        combined_response.update({
+            "transaction_id": py_result.get('transaction_id'),
+            "device_id": py_result.get('device_id'),
+            "merchant_site": py_result.get('merchant_site'),
+            "card_type": py_result.get('card_type'),
+            "card_scheme": py_result.get('card_scheme')
+        })
+    
+    return jsonify(combined_response)
+
+@app.route('/api/check/php', methods=['GET'])
+def php_only_check():
+    """PHP-only check endpoint"""
+    return check_card_single(method='php')
+
+@app.route('/api/check/python', methods=['GET'])  
+def python_only_check():
+    """Python-only check endpoint"""
+    return check_card_single(method='py')
+
+def check_card_single(method):
+    """Single method check"""
+    start_time = time.time()
+    
+    lista = request.args.get('lista')
+    amount = request.args.get('amount', '100')
+    site = request.args.get('site', '')
+    
+    if not lista:
+        return jsonify({"success": False, "error": "Missing parameter: lista"}), 400
+    
+    try:
+        if method == 'php':
+            if not site:
+                return jsonify({"success": False, "error": "Site parameter required for PHP method"}), 400
+            cmd = ['php', 'autorazorpay.php', f'--lista={lista}', f'--amount={amount}', f'--site={site}']
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            data = json.loads(result.stdout) if result.stdout else {}
+            response = parse_php_response(data, lista)
+        else:
+            if not site:
+                return jsonify({"success": False, "error": "Site parameter required for Python method"}), 400
+            py_result = check_url_and_capture(site)
+            response = parse_py_response(py_result, lista)
         
-        amount = data['amount']
-        site_url = data.get('site_url', 'https://razorpay.me/')
-        
-        # Execute your original PHP script
-        php_result = execute_php_checker(card_data, amount, site_url)
-        
-        # Standardize response to your exact format
-        site_name = site_url.split('//')[-1].split('/')[0]
-        final_response = standardize_response(php_result, card_data, amount, {"name": site_name})
-        
-        # Add processing time
-        final_response['processing_time'] = round(time.time() - start_time, 3)
-        
-        return jsonify(final_response)
+        response["processing_time"] = round(time.time() - start_time, 3)
+        return jsonify(response)
         
     except Exception as e:
         return jsonify({
             "success": False,
-            "error": f"API processing error: {str(e)}"
+            "error": f"{method.upper()} execution failed: {str(e)}",
+            "processing_time": round(time.time() - start_time, 3)
         }), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
-        "status": "online",
+        "status": "active",
+        "service": "Parallel Card Checker API",
         "timestamp": int(time.time()),
-        "service": "Card Checker API",
-        "version": "1.0.0"
-    })
-
-@app.route('/')
-def home():
-    return jsonify({
-        "message": "Card Checker API is running",
-        "endpoints": {
-            "check_card": "POST /api/v1/check-card",
-            "health": "GET /health"
-        }
+        "capabilities": ["php_check", "python_check", "parallel_check"],
+        "threading": "enabled"
     })
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=5000, debug=False)
