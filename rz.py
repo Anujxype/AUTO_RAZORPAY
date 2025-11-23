@@ -17,8 +17,8 @@ from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 
 # ---------- CONFIG ----------
-BOT_TOKEN = "YOUR_BOT_TOKEN"
-CHAT_ID = "CHAT_ID"
+BOT_TOKEN = "8144501952:AAE7q3YsM9MVVTsIdeVBNZF8A0fLuzWua_E"
+CHAT_ID = "-1002779754519"
 WAIT_SECONDS = 6
 PROXY_FILE = "proxy.txt" #format -: ip:port:username:pass
 FLASK_HOST = "0.0.0.0"
